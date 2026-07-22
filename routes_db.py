@@ -94,3 +94,22 @@ def update_last_sent(alert_id: int, current_date: str):
             WHERE id = ?
         """, (current_date, alert_id))
         conn.commit()
+
+def get_all_user_alerts(chat_id: str):
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, chat_id, alert_type, scheduled_time, payload FROM alerts
+            WHERE chat_id = ?
+        """, (chat_id,))
+        results = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            try:
+                payload_dict = json.loads(item.pop("payload"))
+                item.update(payload_dict)
+            except Exception as e:
+                logging.error(f"Error parsing payload JSON: {e}")
+            results.append(item)
+        return results
