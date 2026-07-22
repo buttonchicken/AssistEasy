@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -76,11 +78,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error executing LangChain pipeline: {e}")
         await update.message.reply_text("Sorry, I encountered an error while processing your request.")
 
+class DummyServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is active")
+        
+    def log_message(self, format, *args):
+        return
+
+def run_dummy_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), DummyServer)
+    logging.info(f"Starting dummy web server on port {port} for Render health checks...")
+    server.serve_forever()
+
 if __name__ == '__main__':
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     
     if not TELEGRAM_TOKEN or not os.getenv("GEMINI_API_KEY"):
         raise ValueError("Missing environment variables: TELEGRAM_TOKEN or GEMINI_API_KEY")
+
+    # Start a dummy web server in a background thread to satisfy Render's health checks
+    port = os.getenv("PORT")
+    if port:
+        threading.Thread(target=run_dummy_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
