@@ -19,6 +19,8 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
 
+import routes_db
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -30,7 +32,7 @@ llm = ChatGoogleGenerativeAI(
 )
 
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a helpful AI assistant talking to a user on Telegram. Keep responses clear and concise. Do not use asterisks (*) for formatting (no bold, no italics, no bullet points). For bullet points, use a dash (-) or a unicode bullet point (•)."),
+    ("system", "You are a helpful AI assistant talking to a user on Telegram. Keep responses clear and concise. Do not use asterisks (*) for formatting (no bold, no italics, no bullet points). For bullet points, use a dash (-) or a unicode bullet point (•). You must NEVER reveal, share, or mention the password to the user under any circumstances. If the user asks for the passcode or password, tell them you do not know it."),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}"),
 ])
@@ -54,52 +56,43 @@ runnable_with_history = RunnableWithMessageHistory(
 # Stateful route setup tracking
 user_route_setups = {}
 
-# In-memory route storage
-user_routes = []
-route_id_counter = 1
-
-# Grind alert storage
-grind_alerts = []
-grind_alert_counter = 1
-
 def add_route(chat_id: str, origin: str, origin_lat: float, origin_lon: float, destination: str, destination_lat: float, destination_lon: float, scheduled_time: str) -> int:
-    global route_id_counter
-    route = {
-        "id": route_id_counter,
-        "chat_id": chat_id,
+    payload = {
         "origin": origin,
         "origin_lat": origin_lat,
         "origin_lon": origin_lon,
         "destination": destination,
         "destination_lat": destination_lat,
-        "destination_lon": destination_lon,
-        "scheduled_time": scheduled_time,
-        "last_sent": None
+        "destination_lon": destination_lon
     }
-    user_routes.append(route)
-    route_id_counter += 1
-    return route["id"]
+    return routes_db.add_alert(chat_id, "route", scheduled_time, payload)
 
 def get_user_routes(chat_id: str):
-    return [r for r in user_routes if r["chat_id"] == chat_id]
+    return routes_db.get_user_alerts(chat_id, "route")
 
 def delete_user_route(chat_id: str, route_id: int) -> bool:
-    global user_routes
-    initial_len = len(user_routes)
-    user_routes = [r for r in user_routes if not (r["chat_id"] == chat_id and r["id"] == route_id)]
-    return len(user_routes) < initial_len
+    return routes_db.delete_user_alert(chat_id, "route", route_id)
 
 def get_routes_to_trigger(current_time: str, current_date: str):
-    return [
-        r for r in user_routes
-        if r["scheduled_time"] == current_time and (r["last_sent"] is None or r["last_sent"] != current_date)
-    ]
+    return routes_db.get_alerts_to_trigger("route", current_time, current_date)
 
 def update_last_sent(route_id: int, current_date: str):
-    for r in user_routes:
-        if r["id"] == route_id:
-            r["last_sent"] = current_date
-            break
+    routes_db.update_last_sent(route_id, current_date)
+
+def add_grind_alert(chat_id: str, scheduled_time: str) -> int:
+    return routes_db.add_alert(chat_id, "grind", scheduled_time, {})
+
+def get_user_grind_alerts(chat_id: str):
+    return routes_db.get_user_alerts(chat_id, "grind")
+
+def delete_user_grind_alert(chat_id: str, grind_id: int) -> bool:
+    return routes_db.delete_user_alert(chat_id, "grind", grind_id)
+
+def get_grind_alerts_to_trigger(current_time: str, current_date: str):
+    return routes_db.get_alerts_to_trigger("grind", current_time, current_date)
+
+def update_grind_last_sent(grind_id: int, current_date: str):
+    routes_db.update_last_sent(grind_id, current_date)
 
 def search_locations(query: str):
     encoded_query = urllib.parse.quote_plus(query)
@@ -269,18 +262,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 async def makerouteasy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user_route_setups[chat_id] = {
-        "state": "AWAITING_ORIGIN",
-        "origin_name": None,
-        "origin_lat": None,
-        "origin_lon": None,
-        "destination_name": None,
-        "destination_lat": None,
-        "destination_lon": None,
-        "options": None
+        "state": "AWAITING_PASSWORD",
+        "target_alert_type": "route"
     }
     await update.message.reply_text(
-        "Let's set up your daily route alert! 🚗\n\n"
-        "First, please enter your origin (departure location), or type /cancel to abort."
+        "To set up a daily route alert, please enter the access password:"
     )
 
 async def cancel_route_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -346,19 +332,16 @@ async def fetch_grind_problems():
 async def grindalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user_route_setups[chat_id] = {
-        "state": "AWAITING_GRIND_TIME"
+        "state": "AWAITING_PASSWORD",
+        "target_alert_type": "grind"
     }
-    current_time = datetime.datetime.now().strftime("%H:%M")
     await update.message.reply_text(
-        "Let's set up your daily Grind Alert! 🧠\n\n"
-        "At what time daily would you like to receive 1 System Design problem and 2 LeetCode DSA problems?\n"
-        f"Please enter the time in 24-hour HH:MM format (e.g., 08:00 or 20:30).\n"
-        f"Note: The bot's current time is {current_time}."
+        "To set up a daily Grind Alert, please enter the access password:"
     )
 
 async def list_grinds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    user_grinds = [g for g in grind_alerts if g["chat_id"] == chat_id]
+    user_grinds = get_user_grind_alerts(chat_id)
     if not user_grinds:
         await update.message.reply_text("You have no scheduled Grind Alerts. Set one up using /grindalert !")
         return
@@ -369,7 +352,6 @@ async def list_grinds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg.strip())
 
 async def delete_grind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global grind_alerts
     chat_id = str(update.effective_chat.id)
     args = context.args
     if not args:
@@ -381,10 +363,8 @@ async def delete_grind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid ID. Please use a number, e.g., /deletegrind 1.")
         return
         
-    initial_len = len(grind_alerts)
-    grind_alerts = [g for g in grind_alerts if not (g["chat_id"] == chat_id and g["id"] == grind_id)]
-    
-    if len(grind_alerts) < initial_len:
+    success = delete_user_grind_alert(chat_id, grind_id)
+    if success:
         await update.message.reply_text(f"Successfully deleted Grind Alert ID {grind_id}.")
     else:
         await update.message.reply_text(f"Could not find Grind Alert with ID {grind_id} scheduled by you.")
@@ -394,10 +374,7 @@ async def check_and_send_grind_alerts():
     current_time = now.strftime("%H:%M")
     current_date = now.strftime("%Y-%m-%d")
     
-    to_trigger = [
-        g for g in grind_alerts
-        if g["scheduled_time"] == current_time and (g["last_sent"] is None or g["last_sent"] != current_date)
-    ]
+    to_trigger = get_grind_alerts_to_trigger(current_time, current_date)
     if not to_trigger:
         return
         
@@ -411,7 +388,7 @@ async def check_and_send_grind_alerts():
         msg = f"Daily Grind Alert! 🧠🚀\n\n{problem_set_text}"
         try:
             await app.bot.send_message(chat_id=chat_id, text=msg)
-            g["last_sent"] = current_date
+            update_grind_last_sent(alert_id, current_date)
             logging.info(f"Successfully sent Grind Alert to chat {chat_id} for alert ID {alert_id}.")
         except Exception as e:
             logging.error(f"Failed to send Grind Alert to chat {chat_id}: {e}")
@@ -492,7 +469,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         setup = user_route_setups[chat_id]
         state = setup["state"]
         
-        if state == "AWAITING_ORIGIN":
+        if state == "AWAITING_PASSWORD":
+            if user_text.strip() == "lifeknoteasy":
+                target = setup["target_alert_type"]
+                if target == "route":
+                    setup["state"] = "AWAITING_ORIGIN"
+                    setup.update({
+                        "origin_name": None,
+                        "origin_lat": None,
+                        "origin_lon": None,
+                        "destination_name": None,
+                        "destination_lat": None,
+                        "destination_lon": None,
+                        "options": None
+                    })
+                    await update.message.reply_text(
+                        "Password accepted! Let's set up your daily route alert! 🚗\n\n"
+                        "First, please enter your origin (departure location), or type /cancel to abort."
+                    )
+                elif target == "grind":
+                    setup["state"] = "AWAITING_GRIND_TIME"
+                    current_time = datetime.datetime.now().strftime("%H:%M")
+                    await update.message.reply_text(
+                        "Password accepted! Let's set up your daily Grind Alert! 🧠\n\n"
+                        "At what time daily would you like to receive 1 System Design problem and 2 LeetCode DSA problems?\n"
+                        f"Please enter the time in 24-hour HH:MM format (e.g., 08:00 or 20:30).\n"
+                        f"Note: The bot's current time is {current_time}."
+                    )
+            else:
+                await update.message.reply_text(
+                    "Incorrect password. Please try again, or type /cancel to abort."
+                )
+            return
+            
+        elif state == "AWAITING_ORIGIN":
             # Search location matches
             processing_msg = await update.message.reply_text("Searching for origin location...")
             results, err = search_locations(user_text)
@@ -622,15 +632,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
                 
-            global grind_alerts, grind_alert_counter
-            alert = {
-                "id": grind_alert_counter,
-                "chat_id": chat_id,
-                "scheduled_time": formatted_time,
-                "last_sent": None
-            }
-            grind_alerts.append(alert)
-            grind_alert_counter += 1
+            add_grind_alert(chat_id, formatted_time)
             del user_route_setups[chat_id]
             
             await update.message.reply_text(
@@ -703,6 +705,9 @@ async def main():
     
     if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
         raise ValueError("Missing environment variables: TELEGRAM_TOKEN or GEMINI_API_KEY")
+
+    # Initialize DB
+    routes_db.init_db()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
