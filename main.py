@@ -94,6 +94,9 @@ def get_grind_alerts_to_trigger(current_time: str, current_date: str):
 def update_grind_last_sent(grind_id: int, current_date: str):
     routes_db.update_last_sent(grind_id, current_date)
 
+def get_all_user_alerts(chat_id: str):
+    return routes_db.get_all_user_alerts(chat_id)
+
 def search_locations(query: str):
     encoded_query = urllib.parse.quote_plus(query)
     api_key = os.getenv("GOOGLE_MAPS_API_KEY")
@@ -368,6 +371,30 @@ async def delete_grind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Successfully deleted Grind Alert ID {grind_id}.")
     else:
         await update.message.reply_text(f"Could not find Grind Alert with ID {grind_id} scheduled by you.")
+
+async def list_all_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    alerts = get_all_user_alerts(chat_id)
+    if not alerts:
+        await update.message.reply_text("You have no scheduled alerts.")
+        return
+        
+    msg = "Your Scheduled Alerts:\n\n"
+    for a in alerts:
+        if a["alert_type"] == "route":
+            msg += (
+                f"ID: {a['id']} (Route Alert)\n"
+                f"Route: {a['origin']} ➡️ {a['destination']}\n"
+                f"Time: {a['scheduled_time']} daily\n"
+                f"To delete: /deleteroute {a['id']}\n\n"
+            )
+        elif a["alert_type"] == "grind":
+            msg += (
+                f"ID: {a['id']} (Grind Alert)\n"
+                f"Time: {a['scheduled_time']} daily\n"
+                f"To delete: /deletegrind {a['id']}\n\n"
+            )
+    await update.message.reply_text(msg.strip())
 
 async def check_and_send_grind_alerts():
     now = datetime.datetime.now()
@@ -719,6 +746,7 @@ async def main():
     app.add_handler(CommandHandler("grindalert", grindalert))
     app.add_handler(CommandHandler("mygrinds", list_grinds))
     app.add_handler(CommandHandler("deletegrind", delete_grind))
+    app.add_handler(CommandHandler("myalerts", list_all_alerts))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
