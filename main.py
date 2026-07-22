@@ -58,6 +58,10 @@ user_route_setups = {}
 user_routes = []
 route_id_counter = 1
 
+# Grind alert storage
+grind_alerts = []
+grind_alert_counter = 1
+
 def add_route(chat_id: str, origin: str, origin_lat: float, origin_lon: float, destination: str, destination_lat: float, destination_lon: float, scheduled_time: str) -> int:
     global route_id_counter
     route = {
@@ -283,9 +287,9 @@ async def cancel_route_setup(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = str(update.effective_chat.id)
     if chat_id in user_route_setups:
         del user_route_setups[chat_id]
-        await update.message.reply_text("Route setup has been cancelled.")
+        await update.message.reply_text("Alert setup has been cancelled.")
     else:
-        await update.message.reply_text("No active route setup to cancel.")
+        await update.message.reply_text("No active setup to cancel.")
 
 async def list_routes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -316,6 +320,101 @@ async def delete_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Successfully deleted route ID {route_id}.")
     else:
         await update.message.reply_text(f"Could not find route with ID {route_id} scheduled by you.")
+
+async def fetch_grind_problems():
+    prompt = (
+        "Generate a technical study set containing:\n"
+        "1. One System Design problem/topic (e.g., Bitly, Uber, Netflix) with a brief overview of key challenges, database choices, and scaling.\n"
+        "2. Two random DSA (Data Structures and Algorithms) problems. For each, provide the name, difficulty (Easy/Medium/Hard), a brief 1-sentence description, and their official LeetCode link (e.g. https://leetcode.com/problems/two-sum/). Ensure the links are valid.\n\n"
+        "Formatting constraints: Do NOT use asterisks (*) for bold or italics. For lists, use simple dashes (-) or numbers. Keep it clean and readable."
+    )
+    try:
+        response = await llm.ainvoke(prompt)
+        content = response.content
+        if isinstance(content, list):
+            reply_text = "".join(
+                part.get("text", "") if isinstance(part, dict) and part.get("type") == "text" else str(part)
+                for part in content
+            )
+        else:
+            reply_text = str(content)
+        return reply_text
+    except Exception as e:
+        logging.error(f"Error fetching grind problems from Gemini: {e}")
+        return "Could not fetch grind problems today. Please try again later."
+
+async def grindalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    user_route_setups[chat_id] = {
+        "state": "AWAITING_GRIND_TIME"
+    }
+    current_time = datetime.datetime.now().strftime("%H:%M")
+    await update.message.reply_text(
+        "Let's set up your daily Grind Alert! 🧠\n\n"
+        "At what time daily would you like to receive 1 System Design problem and 2 LeetCode DSA problems?\n"
+        f"Please enter the time in 24-hour HH:MM format (e.g., 08:00 or 20:30).\n"
+        f"Note: The bot's current time is {current_time}."
+    )
+
+async def list_grinds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    user_grinds = [g for g in grind_alerts if g["chat_id"] == chat_id]
+    if not user_grinds:
+        await update.message.reply_text("You have no scheduled Grind Alerts. Set one up using /grindalert !")
+        return
+    
+    msg = "Your scheduled Grind Alerts:\n\n"
+    for g in user_grinds:
+        msg += f"ID: {g['id']}\nTime: {g['scheduled_time']} daily\nTo delete: /deletegrind {g['id']}\n\n"
+    await update.message.reply_text(msg.strip())
+
+async def delete_grind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global grind_alerts
+    chat_id = str(update.effective_chat.id)
+    args = context.args
+    if not args:
+        await update.message.reply_text("Please provide the ID of the Grind Alert to delete, e.g., /deletegrind 1.")
+        return
+    try:
+        grind_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid ID. Please use a number, e.g., /deletegrind 1.")
+        return
+        
+    initial_len = len(grind_alerts)
+    grind_alerts = [g for g in grind_alerts if not (g["chat_id"] == chat_id and g["id"] == grind_id)]
+    
+    if len(grind_alerts) < initial_len:
+        await update.message.reply_text(f"Successfully deleted Grind Alert ID {grind_id}.")
+    else:
+        await update.message.reply_text(f"Could not find Grind Alert with ID {grind_id} scheduled by you.")
+
+async def check_and_send_grind_alerts():
+    now = datetime.datetime.now()
+    current_time = now.strftime("%H:%M")
+    current_date = now.strftime("%Y-%m-%d")
+    
+    to_trigger = [
+        g for g in grind_alerts
+        if g["scheduled_time"] == current_time and (g["last_sent"] is None or g["last_sent"] != current_date)
+    ]
+    if not to_trigger:
+        return
+        
+    logging.info(f"Triggering {len(to_trigger)} grind alerts scheduled for {current_time}...")
+    problem_set_text = await fetch_grind_problems()
+    
+    for g in to_trigger:
+        chat_id = g["chat_id"]
+        alert_id = g["id"]
+        
+        msg = f"Daily Grind Alert! 🧠🚀\n\n{problem_set_text}"
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=msg)
+            g["last_sent"] = current_date
+            logging.info(f"Successfully sent Grind Alert to chat {chat_id} for alert ID {alert_id}.")
+        except Exception as e:
+            logging.error(f"Failed to send Grind Alert to chat {chat_id}: {e}")
 
 async def check_and_send_route_alerts():
     now = datetime.datetime.now()
@@ -368,8 +467,9 @@ async def scheduler_loop():
     while True:
         try:
             await check_and_send_route_alerts()
+            await check_and_send_grind_alerts()
         except Exception as e:
-            logging.error(f"Error in check_and_send_route_alerts: {e}")
+            logging.error(f"Error in scheduler check: {e}")
             
         now = datetime.datetime.now()
         sleep_seconds = 60 - now.second
@@ -505,6 +605,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await processing_msg.edit_text(msg)
             return
 
+        elif state == "AWAITING_GRIND_TIME":
+            time_input = user_text.strip()
+            try:
+                parts = time_input.split(":")
+                if len(parts) != 2:
+                    raise ValueError
+                h = int(parts[0])
+                m = int(parts[1])
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError
+                formatted_time = f"{h:02d}:{m:02d}"
+            except ValueError:
+                await update.message.reply_text(
+                    "Invalid time format. Please enter the time in HH:MM format (24-hour, e.g., 08:30 or 17:45)."
+                )
+                return
+                
+            global grind_alerts, grind_alert_counter
+            alert = {
+                "id": grind_alert_counter,
+                "chat_id": chat_id,
+                "scheduled_time": formatted_time,
+                "last_sent": None
+            }
+            grind_alerts.append(alert)
+            grind_alert_counter += 1
+            del user_route_setups[chat_id]
+            
+            await update.message.reply_text(
+                f"Successfully scheduled daily Grind Alert at {formatted_time}! 🚀\n"
+                f"Every day at this time, you will receive your System Design and DSA problems study set."
+            )
+            return
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
@@ -577,6 +711,9 @@ async def main():
     app.add_handler(CommandHandler("cancel", cancel_route_setup))
     app.add_handler(CommandHandler("myroutes", list_routes))
     app.add_handler(CommandHandler("deleteroute", delete_route))
+    app.add_handler(CommandHandler("grindalert", grindalert))
+    app.add_handler(CommandHandler("mygrinds", list_grinds))
+    app.add_handler(CommandHandler("deletegrind", delete_grind))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
