@@ -1,5 +1,8 @@
 import os
 import logging
+import asyncio
+import tornado.web
+import tornado.escape
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -76,9 +79,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error executing LangChain pipeline: {e}")
         await update.message.reply_text("Sorry, I encountered an error while processing your request.")
 
-# Webhook configuration will be loaded from environment variables in the entrypoint.
+class MainHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.write("Bot is active")
 
-if __name__ == '__main__':
+class WebhookHandler(tornado.web.RequestHandler):
+    async def post(self):
+        try:
+            data = tornado.escape.json_decode(self.request.body)
+            update = Update.de_json(data, app.bot)
+            await app.process_update(update)
+            self.write("OK")
+        except Exception as e:
+            logging.error(f"Error processing update: {e}")
+            self.set_status(400)
+            self.write("Error")
+
+    def get(self):
+        self.write("Webhook endpoint is active")
+
+app = None
+
+async def main():
+    global app
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     
@@ -90,6 +113,9 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
+    await app.initialize()
+    await app.start()
+
     external_url = os.getenv("RENDER_EXTERNAL_URL")
     port = os.getenv("PORT", "8080")
 
@@ -97,12 +123,29 @@ if __name__ == '__main__':
         raise ValueError("Missing environment variable: RENDER_EXTERNAL_URL (required for Telegram Webhook)")
 
     port_int = int(port)
-    logging.info(f"Starting Telegram webhook on port {port_int}...")
-    logging.info(f"Webhook URL: {external_url}/webhook")
     
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=port_int,
-        url_path="webhook",
-        webhook_url=f"{external_url}/webhook"
-    )
+    # Configure Tornado application to serve GET and POST
+    tornado_app = tornado.web.Application([
+        (r"/", MainHandler),
+        (r"/webhook", WebhookHandler),
+    ])
+    tornado_app.listen(port_int)
+    logging.info(f"Starting Tornado server on port {port_int}...")
+    logging.info(f"Webhook URL configured: {external_url}/webhook")
+
+    # Set webhook on Telegram
+    await app.bot.set_webhook(url=f"{external_url}/webhook")
+    logging.info("Telegram webhook set successfully.")
+
+    # Keep the loop running
+    try:
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        logging.info("Shutting down bot and server...")
+        await app.stop()
+        await app.shutdown()
+
+if __name__ == '__main__':
+    asyncio.run(main())
