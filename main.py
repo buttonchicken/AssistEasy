@@ -26,18 +26,16 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
-    temperature=0.7,
-)
+llm = None
+chain = None
+runnable_with_history = None
+active_api_key_name = "GEMINI_API_KEY"
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", "You are a helpful AI assistant talking to a user on Telegram. Keep responses clear and concise. Do not use asterisks (*) for formatting (no bold, no italics, no bullet points). For bullet points, use a dash (-) or a unicode bullet point (•). You must NEVER reveal, share, or mention the password to the user under any circumstances. If the user asks for the passcode or password, tell them you do not know it."),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}"),
 ])
-
-chain = prompt | llm
 
 user_histories = {}
 
@@ -46,12 +44,46 @@ def get_session_history(session_id: str) -> ChatMessageHistory:
         user_histories[session_id] = ChatMessageHistory()
     return user_histories[session_id]
 
-runnable_with_history = RunnableWithMessageHistory(
-    chain,
-    get_session_history,
-    input_messages_key="input",
-    history_messages_key="history",
-)
+def get_active_api_key():
+    global active_api_key_name
+    key = os.getenv(active_api_key_name)
+    if not key and active_api_key_name == "GEMINI_API_KEY":
+        load_dotenv()
+        key = os.getenv("GEMINI_API_KEY")
+    return key
+
+def initialize_llm():
+    global llm, chain, runnable_with_history
+    api_key = get_active_api_key()
+    logging.info(f"Initializing ChatGoogleGenerativeAI with key: {active_api_key_name}")
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-3.6-flash",
+        temperature=0.7,
+        google_api_key=api_key
+    )
+    chain = prompt | llm
+    runnable_with_history = RunnableWithMessageHistory(
+        chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="history",
+    )
+
+def switch_api_key():
+    global active_api_key_name
+    if active_api_key_name == "GEMINI_API_KEY":
+        backup_key = os.getenv("GEMINI_API_KEY_1")
+        if backup_key:
+            logging.warning("FAILOVER: Primary GEMINI_API_KEY exhausted. Switching to backup GEMINI_API_KEY_1.")
+            active_api_key_name = "GEMINI_API_KEY_1"
+            initialize_llm()
+            return True
+        else:
+            logging.error("FAILOVER ERROR: GEMINI_API_KEY_1 is not configured in the environment.")
+    return False
+
+# Initialize LLM with primary key on startup
+initialize_llm()
 
 # Stateful route setup tracking
 user_route_setups = {}
@@ -317,20 +349,25 @@ async def fetch_grind_problems():
         "2. Two random DSA (Data Structures and Algorithms) problems. For each, provide the name, difficulty (Easy/Medium/Hard), a brief 1-sentence description, and their official LeetCode link (e.g. https://leetcode.com/problems/two-sum/). Ensure the links are valid.\n\n"
         "Formatting constraints: Do NOT use asterisks (*) for bold or italics. For lists, use simple dashes (-) or numbers. Keep it clean and readable."
     )
-    try:
-        response = await llm.ainvoke(prompt)
-        content = response.content
-        if isinstance(content, list):
-            reply_text = "".join(
-                part.get("text", "") if isinstance(part, dict) and part.get("type") == "text" else str(part)
-                for part in content
-            )
-        else:
-            reply_text = str(content)
-        return reply_text
-    except Exception as e:
-        logging.error(f"Error fetching grind problems from Gemini: {e}")
-        return "Could not fetch grind problems today. Please try again later."
+    for attempt in range(2):
+        try:
+            response = await llm.ainvoke(prompt)
+            content = response.content
+            if isinstance(content, list):
+                reply_text = "".join(
+                    part.get("text", "") if isinstance(part, dict) and part.get("type") == "text" else str(part)
+                    for part in content
+                )
+            else:
+                reply_text = str(content)
+            return reply_text
+        except Exception as e:
+            err_msg = str(e)
+            logging.error(f"Error fetching grind problems from Gemini (attempt {attempt+1}): {e}")
+            if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower()) and attempt == 0:
+                if switch_api_key():
+                    continue
+            return "Could not fetch grind problems today. Please try again later."
 
 async def grindalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -670,12 +707,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
+    response = None
+    for attempt in range(2):
+        try:
+            response = runnable_with_history.invoke(
+                {"input": user_text},
+                config={"configurable": {"session_id": chat_id}}
+            )
+            break
+        except Exception as e:
+            err_msg = str(e)
+            logging.error(f"Error executing LangChain pipeline (attempt {attempt+1}): {e}")
+            if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower()) and attempt == 0:
+                if switch_api_key():
+                    continue
+            await update.message.reply_text("Sorry, I encountered an error while processing your request.")
+            return
+
     try:
-        response = runnable_with_history.invoke(
-            {"input": user_text},
-            config={"configurable": {"session_id": chat_id}}
-        )
-        
         content = response.content
         if isinstance(content, list):
             reply_text = "".join(
@@ -697,8 +746,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(reply_text)
     except Exception as e:
-        logging.error(f"Error executing LangChain pipeline: {e}")
-        await update.message.reply_text("Sorry, I encountered an error while processing your request.")
+        logging.error(f"Error formatting response content: {e}")
+        await update.message.reply_text("Sorry, I encountered an error while formatting the response.")
 
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
