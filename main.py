@@ -27,7 +27,7 @@ llm = ChatGoogleGenerativeAI(
 )
 
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a helpful AI assistant talking to a user on Telegram. Keep responses clear and concise."),
+    ("system", "You are a helpful AI assistant talking to a user on Telegram. Keep responses clear and concise. Do not use asterisks (*) for formatting (no bold, no italics, no bullet points). For bullet points, use a dash (-) or a unicode bullet point (•)."),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}"),
 ])
@@ -52,7 +52,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     if chat_id in user_histories:
         user_histories[chat_id].clear()
-    await update.message.reply_text("Hello! I'm your Gemini AI assistant powered by LangChain. How can I help you today?")
+    await update.message.reply_text("Hello! I'm virtual Aditya, how can I help you today?")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
@@ -74,6 +74,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             reply_text = str(content)
             
+        cleaned_lines = []
+        for line in reply_text.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("* "):
+                indent = line[:len(line) - len(stripped)]
+                line = indent + "• " + stripped[2:]
+            line = line.replace("*", "")
+            cleaned_lines.append(line)
+        reply_text = "\n".join(cleaned_lines)
+
         await update.message.reply_text(reply_text)
     except Exception as e:
         logging.error(f"Error executing LangChain pipeline: {e}")
@@ -82,6 +92,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
         self.write("Bot is active")
+
+class PingHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.write("OK")
 
 class WebhookHandler(tornado.web.RequestHandler):
     async def post(self):
@@ -128,6 +142,7 @@ async def main():
     tornado_app = tornado.web.Application([
         (r"/", MainHandler),
         (r"/webhook", WebhookHandler),
+        (r"/ping", PingHandler),
     ])
     tornado_app.listen(port_int)
     logging.info(f"Starting Tornado server on port {port_int}...")
