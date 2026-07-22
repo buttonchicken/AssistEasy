@@ -1,7 +1,5 @@
 import os
 import logging
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -78,37 +76,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error executing LangChain pipeline: {e}")
         await update.message.reply_text("Sorry, I encountered an error while processing your request.")
 
-class DummyServer(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is active")
-        
-    def log_message(self, format, *args):
-        return
-
-def run_dummy_server():
-    port = int(os.getenv("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), DummyServer)
-    logging.info(f"Starting dummy web server on port {port} for Render health checks...")
-    server.serve_forever()
+# Webhook configuration will be loaded from environment variables in the entrypoint.
 
 if __name__ == '__main__':
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     
-    if not TELEGRAM_TOKEN or not os.getenv("GEMINI_API_KEY"):
+    if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
         raise ValueError("Missing environment variables: TELEGRAM_TOKEN or GEMINI_API_KEY")
-
-    # Start a dummy web server in a background thread to satisfy Render's health checks
-    port = os.getenv("PORT")
-    if port:
-        threading.Thread(target=run_dummy_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
-    print("Bot is running with LangChain integration...")
-    app.run_polling()
+    external_url = os.getenv("RENDER_EXTERNAL_URL")
+    port = os.getenv("PORT", "8080")
+
+    if not external_url:
+        raise ValueError("Missing environment variable: RENDER_EXTERNAL_URL (required for Telegram Webhook)")
+
+    port_int = int(port)
+    logging.info(f"Starting Telegram webhook on port {port_int}...")
+    logging.info(f"Webhook URL: {external_url}/webhook")
+    
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port_int,
+        url_path="webhook",
+        webhook_url=f"{external_url}/webhook"
+    )
