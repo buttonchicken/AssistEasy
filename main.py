@@ -755,7 +755,14 @@ class MainHandler(tornado.web.RequestHandler):
 
 class PingHandler(tornado.web.RequestHandler):
     def get(self):
+        self.set_header("Content-Type", "text/plain")
+        self.set_header("Content-Length", "2")
         self.write("OK")
+
+    def head(self):
+        self.set_header("Content-Type", "text/plain")
+        self.set_header("Content-Length", "2")
+        self.finish()
 
 class WebhookHandler(tornado.web.RequestHandler):
     async def post(self):
