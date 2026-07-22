@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -58,13 +58,17 @@ user_route_setups = {}
 user_routes = []
 route_id_counter = 1
 
-def add_route(chat_id: str, origin: str, destination: str, scheduled_time: str) -> int:
+def add_route(chat_id: str, origin: str, origin_lat: float, origin_lon: float, destination: str, destination_lat: float, destination_lon: float, scheduled_time: str) -> int:
     global route_id_counter
     route = {
         "id": route_id_counter,
         "chat_id": chat_id,
         "origin": origin,
+        "origin_lat": origin_lat,
+        "origin_lon": origin_lon,
         "destination": destination,
+        "destination_lat": destination_lat,
+        "destination_lon": destination_lon,
         "scheduled_time": scheduled_time,
         "last_sent": None
     }
@@ -93,81 +97,104 @@ def update_last_sent(route_id: int, current_date: str):
             r["last_sent"] = current_date
             break
 
-def get_route_info(origin: str, destination: str):
-    # Google Maps Directions URL (works without API key)
-    encoded_origin = urllib.parse.quote_plus(origin)
-    encoded_dest = urllib.parse.quote_plus(destination)
-    map_link = f"https://www.google.com/maps/dir/?api=1&origin={encoded_origin}&destination={encoded_dest}"
-    
-    # Check if Google Maps API key is available
+def search_locations(query: str):
+    encoded_query = urllib.parse.quote_plus(query)
     api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    
     if api_key:
+        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={encoded_query}&key={api_key}"
         try:
-            url = f"https://maps.googleapis.com/maps/api/directions/json?origin={encoded_origin}&destination={encoded_dest}&key={api_key}"
             r = requests.get(url, timeout=10)
             r.raise_for_status()
             data = r.json()
-            if data.get("status") == "OK" and data.get("routes"):
-                leg = data["routes"][0]["legs"][0]
-                distance = leg["distance"]["text"]
-                duration = leg["duration"]["text"]
-                return {
-                    "distance": distance,
-                    "duration": duration,
-                    "map_link": map_link
-                }, None
-            else:
-                logging.warning(f"Google Maps API returned status: {data.get('status')}. Falling back to OSRM.")
+            if data.get("status") == "OK":
+                results = []
+                for r in data["results"][:5]:
+                    results.append({
+                        "display_name": r["formatted_address"],
+                        "lat": r["geometry"]["location"]["lat"],
+                        "lon": r["geometry"]["location"]["lng"]
+                    })
+                return results, None
+            elif data.get("status") == "ZERO_RESULTS":
+                return [], None
+            return [], f"Google API returned: {data.get('status')}"
         except Exception as e:
-            logging.error(f"Error querying Google Maps API: {e}. Falling back to OSRM.")
-
-    # Fallback: Nominatim for geocoding + OSRM for routing
+            logging.error(f"Google Geocoding error: {e}. Falling back to Nominatim.")
+            
+    # Fallback to Nominatim
+    url = f"https://nominatim.openstreetmap.org/search?q={encoded_query}&format=json&limit=5"
     headers = {"User-Agent": "AssistEasyBot/1.0"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for item in data:
+            results.append({
+                "display_name": item["display_name"],
+                "lat": item["lat"],
+                "lon": item["lon"]
+            })
+        return results, None
+    except Exception as e:
+        return [], f"Nominatim API error: {e}"
+
+def build_selection_keyboard(options):
+    keyboard = []
+    for idx, opt in enumerate(options):
+        name = opt["display_name"]
+        if len(name) > 55:
+            name = name[:52] + "..."
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"loc:{idx}")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_route_info_by_coords(lat1, lon1, lat2, lon2, origin_name: str, destination_name: str):
+    # Google Maps Directions URL
+    encoded_origin = urllib.parse.quote_plus(origin_name)
+    encoded_dest = urllib.parse.quote_plus(destination_name)
+    map_link = f"https://www.google.com/maps/dir/?api=1&origin={encoded_origin}&destination={encoded_dest}"
     
-    # Geocode origin
-    origin_url = f"https://nominatim.openstreetmap.org/search?q={encoded_origin}&format=json&limit=1"
-    try:
-        r = requests.get(origin_url, headers=headers, timeout=10)
-        r.raise_for_status()
-        origin_data = r.json()
-        if not origin_data:
-            return None, f"Could not find origin: {origin}"
-        origin_lat = origin_data[0]["lat"]
-        origin_lon = origin_data[0]["lon"]
-    except Exception as e:
-        return None, f"Error geocoding origin: {e}"
-        
-    # Geocode destination
-    dest_url = f"https://nominatim.openstreetmap.org/search?q={encoded_dest}&format=json&limit=1"
-    try:
-        r = requests.get(dest_url, headers=headers, timeout=10)
-        r.raise_for_status()
-        dest_data = r.json()
-        if not dest_data:
-            return None, f"Could not find destination: {destination}"
-        dest_lat = dest_data[0]["lat"]
-        dest_lon = dest_data[0]["lon"]
-    except Exception as e:
-        return None, f"Error geocoding destination: {e}"
-        
-    # Route via OSRM
-    route_url = f"http://router.project-osrm.org/route/v1/driving/{origin_lon},{origin_lat};{dest_lon},{dest_lat}?overview=false"
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    if api_key:
+        try:
+            url = f"https://maps.googleapis.com/maps/api/distancematrix/json?origins={lat1},{lon1}&destinations={lat2},{lon2}&key={api_key}"
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") == "OK" and data.get("rows"):
+                element = data["rows"][0]["elements"][0]
+                if element.get("status") == "OK":
+                    distance = element["distance"]["text"]
+                    duration = element["duration"]["text"]
+                    return {
+                        "distance": distance,
+                        "duration": duration,
+                        "map_link": map_link
+                    }, None
+                else:
+                    logging.warning(f"Google Distance Matrix returned element status: {element.get('status')}. Falling back to OSRM.")
+            else:
+                logging.warning(f"Google Distance Matrix returned status: {data.get('status')}. Falling back to OSRM.")
+        except Exception as e:
+            logging.error(f"Error querying Google Distance Matrix: {e}. Falling back to OSRM.")
+
+    # Fallback to OSRM
+    route_url = f"http://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=false"
     try:
         r = requests.get(route_url, timeout=10)
         r.raise_for_status()
         route_data = r.json()
         if "routes" not in route_data or not route_data["routes"]:
-            return None, "No route found between these locations"
+            return None, "No route found between these coordinates"
             
         route = route_data["routes"][0]
         distance_meters = route["distance"]
         duration_seconds = route["duration"]
         
-        # Format distance
         distance_km = distance_meters / 1000.0
         distance_str = f"{distance_km:.1f} km"
         
-        # Format duration
         minutes = int(duration_seconds / 60)
         if minutes < 60:
             duration_str = f"{minutes} mins"
@@ -184,12 +211,68 @@ def get_route_info(origin: str, destination: str):
     except Exception as e:
         return None, f"Error calling routing service: {e}"
 
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = str(update.effective_chat.id)
+    if chat_id not in user_route_setups:
+        await query.edit_message_text("This session has expired. Please start over with /makerouteasy.")
+        return
+        
+    setup = user_route_setups[chat_id]
+    state = setup["state"]
+    data = query.data
+    
+    if not data.startswith("loc:"):
+        return
+        
+    try:
+        idx = int(data.split(":")[1])
+        selected_loc = setup["options"][idx]
+    except (IndexError, ValueError):
+        await query.edit_message_text("Error selecting location. Please start over with /makerouteasy.")
+        return
+        
+    if state == "SELECTING_ORIGIN":
+        setup["origin_name"] = selected_loc["display_name"]
+        setup["origin_lat"] = selected_loc["lat"]
+        setup["origin_lon"] = selected_loc["lon"]
+        
+        setup["state"] = "AWAITING_DESTINATION"
+        setup["options"] = None
+        
+        await query.edit_message_text(
+            f"Origin set to: {selected_loc['display_name']}\n\n"
+            "Now, please enter your destination (arrival location), or type /cancel to abort."
+        )
+        
+    elif state == "SELECTING_DESTINATION":
+        setup["destination_name"] = selected_loc["display_name"]
+        setup["destination_lat"] = selected_loc["lat"]
+        setup["destination_lon"] = selected_loc["lon"]
+        
+        setup["state"] = "AWAITING_TIME"
+        setup["options"] = None
+        
+        current_time = datetime.datetime.now().strftime("%H:%M")
+        await query.edit_message_text(
+            f"Destination set to: {selected_loc['display_name']}\n\n"
+            f"Finally, please enter the daily scheduled time in 24-hour HH:MM format (e.g., 08:30 or 17:45).\n"
+            f"Note: The bot's current time is {current_time}."
+        )
+
 async def makerouteasy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user_route_setups[chat_id] = {
         "state": "AWAITING_ORIGIN",
-        "origin": None,
-        "destination": None
+        "origin_name": None,
+        "origin_lat": None,
+        "origin_lon": None,
+        "destination_name": None,
+        "destination_lat": None,
+        "destination_lon": None,
+        "options": None
     }
     await update.message.reply_text(
         "Let's set up your daily route alert! 🚗\n\n"
@@ -250,8 +333,12 @@ async def check_and_send_route_alerts():
         chat_id = r["chat_id"]
         origin = r["origin"]
         destination = r["destination"]
+        lat1 = r["origin_lat"]
+        lon1 = r["origin_lon"]
+        lat2 = r["destination_lat"]
+        lon2 = r["destination_lon"]
         
-        res, err = get_route_info(origin, destination)
+        res, err = get_route_info_by_coords(lat1, lon1, lat2, lon2, origin, destination)
         if err:
             logging.error(f"Scheduler failed to calculate route for ID {route_id}: {err}")
             msg = (
@@ -306,23 +393,67 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = setup["state"]
         
         if state == "AWAITING_ORIGIN":
-            setup["origin"] = user_text
-            setup["state"] = "AWAITING_DESTINATION"
-            await update.message.reply_text(
-                f"Origin set to: {user_text}\n\n"
-                "Now, please enter your destination (arrival location), or type /cancel to abort."
-            )
+            # Search location matches
+            processing_msg = await update.message.reply_text("Searching for origin location...")
+            results, err = search_locations(user_text)
+            if err:
+                await processing_msg.edit_text(f"Error searching location: {err}. Please try again.")
+                return
+            if not results:
+                await processing_msg.edit_text(f"Could not find any locations matching '{user_text}'. Please try again or be more specific.")
+                return
+                
+            if len(results) == 1:
+                setup["origin_name"] = results[0]["display_name"]
+                setup["origin_lat"] = results[0]["lat"]
+                setup["origin_lon"] = results[0]["lon"]
+                setup["state"] = "AWAITING_DESTINATION"
+                await processing_msg.edit_text(
+                    f"Origin set to: {results[0]['display_name']}\n\n"
+                    "Now, please enter your destination (arrival location), or type /cancel to abort."
+                )
+            else:
+                setup["options"] = results
+                setup["state"] = "SELECTING_ORIGIN"
+                reply_markup = build_selection_keyboard(results)
+                await processing_msg.delete() # delete search message
+                await update.message.reply_text(
+                    f"Multiple matches found for '{user_text}'. Please select the correct origin:",
+                    reply_markup=reply_markup
+                )
             return
             
         elif state == "AWAITING_DESTINATION":
-            setup["destination"] = user_text
-            setup["state"] = "AWAITING_TIME"
-            current_time = datetime.datetime.now().strftime("%H:%M")
-            await update.message.reply_text(
-                f"Destination set to: {user_text}\n\n"
-                f"Finally, please enter the daily scheduled time in 24-hour HH:MM format (e.g., 08:30 or 17:45).\n"
-                f"Note: The bot's current time is {current_time}."
-            )
+            # Search location matches
+            processing_msg = await update.message.reply_text("Searching for destination location...")
+            results, err = search_locations(user_text)
+            if err:
+                await processing_msg.edit_text(f"Error searching location: {err}. Please try again.")
+                return
+            if not results:
+                await processing_msg.edit_text(f"Could not find any locations matching '{user_text}'. Please try again or be more specific.")
+                return
+                
+            if len(results) == 1:
+                setup["destination_name"] = results[0]["display_name"]
+                setup["destination_lat"] = results[0]["lat"]
+                setup["destination_lon"] = results[0]["lon"]
+                setup["state"] = "AWAITING_TIME"
+                current_time = datetime.datetime.now().strftime("%H:%M")
+                await processing_msg.edit_text(
+                    f"Destination set to: {results[0]['display_name']}\n\n"
+                    f"Finally, please enter the daily scheduled time in 24-hour HH:MM format (e.g., 08:30 or 17:45).\n"
+                    f"Note: The bot's current time is {current_time}."
+                )
+            else:
+                setup["options"] = results
+                setup["state"] = "SELECTING_DESTINATION"
+                reply_markup = build_selection_keyboard(results)
+                await processing_msg.delete() # delete search message
+                await update.message.reply_text(
+                    f"Multiple matches found for '{user_text}'. Please select the correct destination:",
+                    reply_markup=reply_markup
+                )
             return
             
         elif state == "AWAITING_TIME":
@@ -342,27 +473,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
                 
-            origin = setup["origin"]
-            destination = setup["destination"]
+            origin_name = setup["origin_name"]
+            origin_lat = setup["origin_lat"]
+            origin_lon = setup["origin_lon"]
+            dest_name = setup["destination_name"]
+            dest_lat = setup["destination_lat"]
+            dest_lon = setup["destination_lon"]
             
-            processing_msg = await update.message.reply_text("Saving route and checking initial travel details...")
-            res, err = get_route_info(origin, destination)
+            processing_msg = await update.message.reply_text("Saving route and checking travel details...")
+            res, err = get_route_info_by_coords(origin_lat, origin_lon, dest_lat, dest_lon, origin_name, dest_name)
             if err:
                 logging.error(f"Error checking route details: {err}")
-                add_route(chat_id, origin, destination, formatted_time)
+                add_route(chat_id, origin_name, origin_lat, origin_lon, dest_name, dest_lat, dest_lon, formatted_time)
                 del user_route_setups[chat_id]
                 await processing_msg.edit_text(
                     f"Successfully scheduled daily route alert for {formatted_time}!\n\n"
-                    f"Route: {origin} ➡️ {destination}\n\n"
+                    f"Route: {origin_name} ➡️ {dest_name}\n\n"
                     f"Warning: Could not fetch initial distance/ETA details: {err}. We will try again when the daily alert triggers."
                 )
             else:
-                add_route(chat_id, origin, destination, formatted_time)
+                add_route(chat_id, origin_name, origin_lat, origin_lon, dest_name, dest_lat, dest_lon, formatted_time)
                 del user_route_setups[chat_id]
                 
                 msg = (
                     f"Successfully scheduled daily route alert for {formatted_time}!\n\n"
-                    f"Route: {origin} ➡️ {destination}\n"
+                    f"Route: {origin_name} ➡️ {dest_name}\n"
                     f"Estimated Duration: {res['duration']}\n"
                     f"Shortest Distance: {res['distance']}\n\n"
                     f"Google Maps Link: {res['map_link']}"
@@ -442,6 +577,7 @@ async def main():
     app.add_handler(CommandHandler("cancel", cancel_route_setup))
     app.add_handler(CommandHandler("myroutes", list_routes))
     app.add_handler(CommandHandler("deleteroute", delete_route))
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
     await app.initialize()
