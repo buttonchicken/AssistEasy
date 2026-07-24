@@ -149,6 +149,24 @@ def get_grind_alerts_to_trigger(current_time: str, current_date: str):
 def update_grind_last_sent(grind_id: int, current_date: str):
     routes_db.update_last_sent(grind_id, current_date)
 
+# --- Job Alert DB helpers ---
+
+def add_job_alert(chat_id: str, domain: str, experience: str, location: str, freshness_seconds: int, scheduled_time: str) -> int:
+    payload = {"domain": domain, "experience": experience, "location": location, "freshness_seconds": freshness_seconds}
+    return routes_db.add_alert(chat_id, "job", scheduled_time, payload)
+
+def get_user_job_alerts(chat_id: str):
+    return routes_db.get_user_alerts(chat_id, "job")
+
+def delete_user_job_alert(chat_id: str, job_id: int) -> bool:
+    return routes_db.delete_user_alert(chat_id, "job", job_id)
+
+def get_job_alerts_to_trigger(current_time: str, current_date: str):
+    return routes_db.get_alerts_to_trigger("job", current_time, current_date)
+
+def update_job_last_sent(job_id: int, current_date: str):
+    routes_db.update_last_sent(job_id, current_date)
+
 def get_all_user_alerts(chat_id: str):
     return routes_db.get_all_user_alerts(chat_id)
 
@@ -417,6 +435,98 @@ async def fetch_grind_problems():
                     continue
             return "Could not fetch grind problems today. Please try again later."
 
+def scrape_linkedin_jobs(domain: str, location: str, freshness_seconds: int, max_results: int = 5) -> str:
+    """Scrape real job listings from LinkedIn's public guest search endpoint."""
+    from bs4 import BeautifulSoup
+    import time
+    import random
+
+    # Build query URL
+    keywords = urllib.parse.quote_plus(domain)
+    loc_encoded = urllib.parse.quote_plus(location) if location.lower() not in ("remote", "any") else urllib.parse.quote_plus("Worldwide")
+    freshness_param = f"&f_TPR=r{freshness_seconds}" if freshness_seconds else ""
+    url = (
+        f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        f"?keywords={keywords}&location={loc_encoded}&start=0&sortBy=DD{freshness_param}"
+    )
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.linkedin.com/",
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        logging.error(f"LinkedIn scraper HTTP error: {e}")
+        return None
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    job_cards = soup.find_all("li")
+
+    results = []
+    for card in job_cards:
+        if len(results) >= max_results:
+            break
+        try:
+            title_el = card.find("h3", class_="base-search-card__title")
+            company_el = card.find("h4", class_="base-search-card__subtitle")
+            location_el = card.find("span", class_="job-search-card__location")
+            link_el = card.find("a", class_="base-card__full-link")
+            posted_el = card.find("time")
+
+            title = title_el.get_text(strip=True) if title_el else "N/A"
+            company = company_el.get_text(strip=True) if company_el else "N/A"
+            loc = location_el.get_text(strip=True) if location_el else "N/A"
+            link = link_el["href"].split("?")[0] if link_el and link_el.get("href") else "N/A"
+            posted = posted_el["datetime"] if posted_el and posted_el.get("datetime") else ""
+
+            if title == "N/A" and company == "N/A":
+                continue
+            results.append({"title": title, "company": company, "location": loc, "link": link, "posted": posted})
+        except Exception:
+            continue
+
+    return results
+
+async def fetch_jobs(domain: str, experience: str, location: str, freshness_seconds: int) -> str:
+    """Scrape LinkedIn for real job listings and return a formatted string."""
+    loop = asyncio.get_event_loop()
+    jobs = await loop.run_in_executor(None, scrape_linkedin_jobs, domain, location, freshness_seconds)
+
+    freshness_labels = {
+        3600: "past 1 hour", 7200: "past 2 hours", 28800: "past 8 hours",
+        86400: "past 24 hours", 172800: "past 2 days", 604800: "past week", 2592000: "past month"
+    }
+    freshness_label = freshness_labels.get(freshness_seconds, f"past {freshness_seconds//3600} hours")
+
+    if not jobs:
+        # Fallback: return a clickable LinkedIn search link
+        kw = urllib.parse.quote_plus(domain)
+        loc_enc = urllib.parse.quote_plus(location)
+        tpr = f"&f_TPR=r{freshness_seconds}" if freshness_seconds else ""
+        fallback_url = f"https://www.linkedin.com/jobs/search/?keywords={kw}&location={loc_enc}&sortBy=DD{tpr}"
+        return (
+            f"Could not scrape live listings right now (LinkedIn may be rate-limiting).\n"
+            f"Search manually here:\n{fallback_url}"
+        )
+
+    lines = [f"Found {len(jobs)} job(s) posted in the {freshness_label}:\n"]
+    for i, j in enumerate(jobs, 1):
+        lines.append(
+            f"{i}. {j['title']}\n"
+            f"   Company: {j['company']}\n"
+            f"   Location: {j['location']}\n"
+            f"   Posted: {j['posted']}\n"
+            f"   Link: {j['link']}"
+        )
+    return "\n\n".join(lines)
+
 async def grindalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user_route_setups[chat_id] = {
@@ -457,6 +567,57 @@ async def delete_grind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"Could not find Grind Alert with ID {grind_id} scheduled by you.")
 
+async def jobalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    user_route_setups[chat_id] = {
+        "state": "AWAITING_PASSWORD",
+        "target_alert_type": "job"
+    }
+    await update.message.reply_text(
+        "To set up a daily Job Alert, please enter the access password:"
+    )
+
+async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    user_jobs = get_user_job_alerts(chat_id)
+    if not user_jobs:
+        await update.message.reply_text("You have no scheduled Job Alerts. Set one up using /jobalert !")
+        return
+    msg = "Your scheduled Job Alerts:\n\n"
+    for j in user_jobs:
+        freshness_labels = {
+            3600: "Past 1 hour", 7200: "Past 2 hours", 28800: "Past 8 hours",
+            86400: "Past 24 hours", 172800: "Past 2 days", 604800: "Past week", 2592000: "Past month"
+        }
+        freshness_label = freshness_labels.get(j.get("freshness_seconds", 86400), "Past 24 hours")
+        msg += (
+            f"ID: {j['id']}\n"
+            f"Domain: {j.get('domain', 'N/A')}\n"
+            f"Experience: {j.get('experience', 'N/A')}\n"
+            f"Location: {j.get('location', 'N/A')}\n"
+            f"Freshness: {freshness_label}\n"
+            f"Time: {j['scheduled_time']} daily\n"
+            f"To delete: /deletejob {j['id']}\n\n"
+        )
+    await update.message.reply_text(msg.strip())
+
+async def delete_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    args = context.args
+    if not args:
+        await update.message.reply_text("Please provide the ID of the Job Alert to delete, e.g., /deletejob 5.")
+        return
+    try:
+        job_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid ID. Please use a number, e.g., /deletejob 5.")
+        return
+    success = delete_user_job_alert(chat_id, job_id)
+    if success:
+        await update.message.reply_text(f"Successfully deleted Job Alert ID {job_id}.")
+    else:
+        await update.message.reply_text(f"Could not find Job Alert with ID {job_id} scheduled by you.")
+
 async def list_all_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     alerts = get_all_user_alerts(chat_id)
@@ -478,6 +639,21 @@ async def list_all_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"ID: {a['id']} (Grind Alert)\n"
                 f"Time: {a['scheduled_time']} daily\n"
                 f"To delete: /deletegrind {a['id']}\n\n"
+            )
+        elif a["alert_type"] == "job":
+            freshness_labels = {
+                3600: "Past 1 hour", 7200: "Past 2 hours", 28800: "Past 8 hours",
+                86400: "Past 24 hours", 172800: "Past 2 days", 604800: "Past week", 2592000: "Past month"
+            }
+            freshness_label = freshness_labels.get(a.get("freshness_seconds", 86400), "Past 24 hours")
+            msg += (
+                f"ID: {a['id']} (Job Alert)\n"
+                f"Domain: {a.get('domain', 'N/A')}\n"
+                f"Experience: {a.get('experience', 'N/A')}\n"
+                f"Location: {a.get('location', 'N/A')}\n"
+                f"Freshness: {freshness_label}\n"
+                f"Time: {a['scheduled_time']} daily\n"
+                f"To delete: /deletejob {a['id']}\n\n"
             )
     await update.message.reply_text(msg.strip())
 
@@ -551,12 +727,41 @@ async def check_and_send_route_alerts():
         except Exception as e:
             logging.error(f"Failed to send route alert to chat {chat_id}: {e}")
 
+async def check_and_send_job_alerts():
+    now = datetime.datetime.now()
+    current_time = now.strftime("%H:%M")
+    current_date = now.strftime("%Y-%m-%d")
+
+    to_trigger = get_job_alerts_to_trigger(current_time, current_date)
+    if not to_trigger:
+        return
+
+    logging.info(f"Triggering {len(to_trigger)} job alerts scheduled for {current_time}...")
+
+    for j in to_trigger:
+        chat_id = j["chat_id"]
+        alert_id = j["id"]
+        domain = j.get("domain", "Tech")
+        experience = j.get("experience", "Any")
+        location = j.get("location", "Remote")
+        freshness_seconds = j.get("freshness_seconds", 86400)
+
+        job_listings = await fetch_jobs(domain, experience, location, freshness_seconds)
+        msg = f"Daily Job Alert! 💼\nDomain: {domain} | Experience: {experience} | Location: {location}\n\n{job_listings}"
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=msg)
+            update_job_last_sent(alert_id, current_date)
+            logging.info(f"Sent Job Alert to chat {chat_id} for alert ID {alert_id}.")
+        except Exception as e:
+            logging.error(f"Failed to send Job Alert to chat {chat_id}: {e}")
+
 async def scheduler_loop():
     logging.info("Starting background route alert scheduler loop...")
     while True:
         try:
             await check_and_send_route_alerts()
             await check_and_send_grind_alerts()
+            await check_and_send_job_alerts()
         except Exception as e:
             logging.error(f"Error in scheduler check: {e}")
             
@@ -607,6 +812,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "At what time daily would you like to receive 1 System Design problem and 2 LeetCode DSA problems?\n"
                         f"Please enter the time in 24-hour HH:MM format (e.g., 08:00 or 20:30).\n"
                         f"Note: The bot's current time is {current_time}."
+                    )
+                elif target == "job":
+                    setup["state"] = "AWAITING_JOB_DOMAIN"
+                    await update.message.reply_text(
+                        "Password accepted! Let's set up your daily Job Alert! 💼\n\n"
+                        "What job domain are you looking for? (e.g., Backend Engineering, Data Science, ML Engineer, Product Manager)\n\n"
+                        "Type /cancel to abort."
                     )
             else:
                 await update.message.reply_text(
@@ -753,6 +965,110 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        elif state == "AWAITING_JOB_DOMAIN":
+            setup["domain"] = user_text.strip()
+            setup["state"] = "AWAITING_JOB_EXPERIENCE"
+            await update.message.reply_text(
+                f"Domain: {setup['domain']} ✓\n\n"
+                "What is your experience level? (e.g., Fresher, 1-2 years, 3-5 years, Senior, 8+ years)\n\n"
+                "Type /cancel to abort."
+            )
+            return
+
+        elif state == "AWAITING_JOB_EXPERIENCE":
+            setup["experience"] = user_text.strip()
+            setup["state"] = "AWAITING_JOB_LOCATION"
+            await update.message.reply_text(
+                f"Experience: {setup['experience']} ✓\n\n"
+                "What is your preferred work location or remote preference?\n"
+                "(e.g., Remote, Bangalore, New York, Hybrid - London, Any)\n\n"
+                "Type /cancel to abort."
+            )
+            return
+
+        elif state == "AWAITING_JOB_LOCATION":
+            setup["location"] = user_text.strip()
+            setup["state"] = "AWAITING_JOB_FRESHNESS"
+            await update.message.reply_text(
+                f"Location: {setup['location']} ✓\n\n"
+                "How recent should the job postings be?\n"
+                "Reply with one of the following options:\n"
+                "  1 - Past 1 hour\n"
+                "  2 - Past 2 hours\n"
+                "  3 - Past 8 hours\n"
+                "  4 - Past 24 hours\n"
+                "  5 - Past 2 days\n"
+                "  6 - Past week\n"
+                "  7 - Past month\n\n"
+                "Type /cancel to abort."
+            )
+            return
+
+        elif state == "AWAITING_JOB_FRESHNESS":
+            freshness_map = {
+                "1": 3600,
+                "2": 7200,
+                "3": 28800,
+                "4": 86400,
+                "5": 172800,
+                "6": 604800,
+                "7": 2592000
+            }
+            freshness_labels = {
+                "1": "Past 1 hour", "2": "Past 2 hours", "3": "Past 8 hours",
+                "4": "Past 24 hours", "5": "Past 2 days", "6": "Past week", "7": "Past month"
+            }
+            choice = user_text.strip()
+            if choice not in freshness_map:
+                await update.message.reply_text(
+                    "Invalid choice. Please reply with a number from 1 to 7.\n"
+                    "  1 - Past 1 hour\n  2 - Past 2 hours\n  3 - Past 8 hours\n"
+                    "  4 - Past 24 hours\n  5 - Past 2 days\n  6 - Past week\n  7 - Past month"
+                )
+                return
+            setup["freshness_seconds"] = freshness_map[choice]
+            setup["freshness_label"] = freshness_labels[choice]
+            setup["state"] = "AWAITING_JOB_TIME"
+            current_time = datetime.datetime.now().strftime("%H:%M")
+            await update.message.reply_text(
+                f"Freshness: {freshness_labels[choice]} ✓\n\n"
+                "At what time daily would you like to receive your job listings?\n"
+                f"Please enter the time in 24-hour HH:MM format (e.g., 09:00 or 18:00).\n"
+                f"Note: The bot's current time is {current_time}.\n\n"
+                "Type /cancel to abort."
+            )
+            return
+
+        elif state == "AWAITING_JOB_TIME":
+            time_input = user_text.strip()
+            try:
+                parts = time_input.split(":")
+                if len(parts) != 2:
+                    raise ValueError
+                h = int(parts[0])
+                m = int(parts[1])
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError
+                formatted_time = f"{h:02d}:{m:02d}"
+            except ValueError:
+                await update.message.reply_text(
+                    "Invalid time format. Please enter the time in HH:MM format (e.g., 09:00)."
+                )
+                return
+
+            add_job_alert(chat_id, setup["domain"], setup["experience"], setup["location"], setup.get("freshness_seconds", 86400), formatted_time)
+            del user_route_setups[chat_id]
+
+            await update.message.reply_text(
+                f"Daily Job Alert scheduled for {formatted_time}! 💼\n\n"
+                f"Domain: {setup['domain']}\n"
+                f"Experience: {setup['experience']}\n"
+                f"Location: {setup['location']}\n"
+                f"Freshness: {setup.get('freshness_label', 'Past 24 hours')}\n\n"
+                f"Every day at this time you will receive live scraped job listings from LinkedIn."
+            )
+            return
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     response = None
@@ -850,6 +1166,9 @@ async def main():
     app.add_handler(CommandHandler("grindalert", grindalert))
     app.add_handler(CommandHandler("mygrinds", list_grinds))
     app.add_handler(CommandHandler("deletegrind", delete_grind))
+    app.add_handler(CommandHandler("jobalert", jobalert))
+    app.add_handler(CommandHandler("myjobs", list_jobs))
+    app.add_handler(CommandHandler("deletejob", delete_job))
     app.add_handler(CommandHandler("myalerts", list_all_alerts))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))

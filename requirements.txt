@@ -48,3 +48,5 @@ xxhash==3.8.1
 zstandard==0.25.0
 tornado==6.5.7
 langchain-groq
+beautifulsoup4
+lxml
