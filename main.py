@@ -53,14 +53,25 @@ def get_active_api_key():
     return key
 
 def initialize_llm():
-    global llm, chain, runnable_with_history
+    global llm, chain, runnable_with_history, active_api_key_name
     api_key = get_active_api_key()
-    logging.info(f"Initializing ChatGoogleGenerativeAI with key: {active_api_key_name}")
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-3.6-flash",
-        temperature=0.7,
-        google_api_key=api_key
-    )
+    
+    if active_api_key_name == "GROQ_API_KEY":
+        logging.info("Initializing ChatGroq with key: GROQ_API_KEY")
+        from langchain_groq import ChatGroq
+        llm = ChatGroq(
+            model="llama-3.3-70b-versatile",
+            temperature=0.7,
+            groq_api_key=api_key
+        )
+    else:
+        logging.info(f"Initializing ChatGoogleGenerativeAI with key: {active_api_key_name}")
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-3.6-flash",
+            temperature=0.7,
+            google_api_key=api_key
+        )
+        
     chain = prompt | llm
     runnable_with_history = RunnableWithMessageHistory(
         chain,
@@ -79,7 +90,19 @@ def switch_api_key():
             initialize_llm()
             return True
         else:
-            logging.error("FAILOVER ERROR: GEMINI_API_KEY_1 is not configured in the environment.")
+            logging.warning("Primary GEMINI_API_KEY exhausted, and GEMINI_API_KEY_1 is not set. Checking GROQ_API_KEY...")
+            active_api_key_name = "GEMINI_API_KEY_1"
+            
+    if active_api_key_name == "GEMINI_API_KEY_1":
+        groq_key = os.getenv("GROQ_API_KEY")
+        if groq_key:
+            logging.warning("FAILOVER: Gemini API keys exhausted. Switching to fallback GROQ_API_KEY.")
+            active_api_key_name = "GROQ_API_KEY"
+            initialize_llm()
+            return True
+        else:
+            logging.error("FAILOVER ERROR: Neither GEMINI_API_KEY_1 nor GROQ_API_KEY is configured in the environment.")
+            
     return False
 
 # Initialize LLM with primary key on startup
@@ -342,14 +365,39 @@ async def delete_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"Could not find route with ID {route_id} scheduled by you.")
 
+SYSTEM_DESIGN_DOMAINS = [
+    "Bitly (URL shortener)", "Uber (Ride sharing / Geolocation)", "Netflix or YouTube (Video streaming / CDN)",
+    "Dropbox or Google Drive (File sync & storage)", "Twitter or Facebook (News feed architecture)",
+    "WhatsApp or Slack (Real-time chat & presence)", "Airbnb or Booking.com (Hotel reservation)",
+    "Tinder (Matchmaking & location query)", "Amazon (Distributed shopping cart & checkout)",
+    "Web Crawler (Politeness, duplicate detection, URL frontier)", "Distributed Rate Limiter",
+    "Distributed Cache (e.g., Memcached / Redis)", "Ad Click Event Aggregator (Stream processing)",
+    "Snowflake (Distributed Unique ID generator)", "Push Notification System",
+    "Google Search Autocomplete (Trie, MapReduce)", "Gaming Leaderboard (Redis Sorted Sets)",
+    "API Gateway", "Distributed Job Scheduler"
+]
+
+DSA_TOPICS = [
+    "Sliding Window", "Two Pointers", "Fast & Slow Pointers", "Merge Intervals",
+    "In-place Reversal of a Linked List", "Breadth-First Search (BFS)",
+    "Depth-First Search (DFS)", "Two Heaps", "Subsets (Backtracking)", "Modified Binary Search",
+    "Top K Elements (Heaps)", "K-way Merge", "Topological Sort (Graphs)", "Dynamic Programming (Knapsack/DP)",
+    "Trie (Prefix Tree)", "Union Find / Disjoint Set", "Segment Tree or Fenwick Tree", "Monotonic Stack / Queue"
+]
+
 async def fetch_grind_problems():
+    import random
+    sys_topic = random.choice(SYSTEM_DESIGN_DOMAINS)
+    dsa_topic_1 = random.choice(DSA_TOPICS)
+    dsa_topic_2 = random.choice([t for t in DSA_TOPICS if t != dsa_topic_1])
+
     prompt = (
-        "Generate a technical study set containing:\n"
-        "1. One System Design problem/topic (e.g., Bitly, Uber, Netflix) with a brief overview of key challenges, database choices, and scaling.\n"
-        "2. Two random DSA (Data Structures and Algorithms) problems. For each, provide the name, difficulty (Easy/Medium/Hard), a brief 1-sentence description, and their official LeetCode link (e.g. https://leetcode.com/problems/two-sum/). Ensure the links are valid.\n\n"
-        "Formatting constraints: Do NOT use asterisks (*) for bold or italics. For lists, use simple dashes (-) or numbers. Keep it clean and readable."
+        f"Generate a technical study set containing:\n"
+        f"1. One System Design problem/topic related to: {sys_topic}. Provide a brief overview of key challenges, database choices, and scaling.\n"
+        f"2. Two random DSA (Data Structures and Algorithms) problems. One problem must focus on the concept of '{dsa_topic_1}', and the other must focus on the concept of '{dsa_topic_2}'. For each, provide the name, difficulty (Easy/Medium/Hard), a brief 1-sentence description, and their official LeetCode link. Ensure the links are valid.\n\n"
+        f"Formatting constraints: Do NOT use asterisks (*) for bold or italics. For lists, use simple dashes (-) or numbers. Keep it clean and readable."
     )
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             response = await llm.ainvoke(prompt)
             content = response.content
@@ -363,8 +411,8 @@ async def fetch_grind_problems():
             return reply_text
         except Exception as e:
             err_msg = str(e)
-            logging.error(f"Error fetching grind problems from Gemini (attempt {attempt+1}): {e}")
-            if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower()) and attempt == 0:
+            logging.error(f"Error fetching grind problems from Gemini/Groq (attempt {attempt+1}): {e}")
+            if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower() or "rate_limit" in err_msg.lower() or "limit" in err_msg.lower()) and attempt < 2:
                 if switch_api_key():
                     continue
             return "Could not fetch grind problems today. Please try again later."
@@ -708,7 +756,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     response = None
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             response = runnable_with_history.invoke(
                 {"input": user_text},
@@ -718,7 +766,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             err_msg = str(e)
             logging.error(f"Error executing LangChain pipeline (attempt {attempt+1}): {e}")
-            if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower()) and attempt == 0:
+            if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower() or "rate_limit" in err_msg.lower() or "limit" in err_msg.lower()) and attempt < 2:
                 if switch_api_key():
                     continue
             await update.message.reply_text("Sorry, I encountered an error while processing your request.")
