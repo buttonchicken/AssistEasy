@@ -7,6 +7,7 @@ import urllib.parse
 import requests
 import tornado.web
 import tornado.escape
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -26,6 +27,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+
+# The bot always operates in IST, regardless of the host server's system timezone.
+IST = ZoneInfo("Asia/Kolkata")
+
+def now_ist() -> datetime.datetime:
+    return datetime.datetime.now(IST)
 
 llm = None
 chain = None
@@ -329,7 +336,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         setup["state"] = "AWAITING_TIME"
         setup["options"] = None
         
-        current_time = datetime.datetime.now().strftime("%H:%M")
+        current_time = now_ist().strftime("%H:%M")
         await query.edit_message_text(
             f"Destination set to: {selected_loc['display_name']}\n\n"
             f"Finally, please enter the daily scheduled time in 24-hour HH:MM format (e.g., 08:30 or 17:45).\n"
@@ -427,7 +434,7 @@ def _scrape_system_design_topics() -> list:
 async def get_system_design_topic() -> str:
     """Return a random system design case study title, live-scraped and cached for a day."""
     import random
-    now = datetime.datetime.now()
+    now = now_ist()
     cache = _SYSTEM_DESIGN_TOPICS_CACHE
     if not (cache["topics"] and cache["fetched_at"] and now - cache["fetched_at"] < _SYSTEM_DESIGN_CACHE_TTL):
         try:
@@ -767,7 +774,7 @@ async def list_all_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg.strip())
 
 async def check_and_send_grind_alerts():
-    now = datetime.datetime.now()
+    now = now_ist()
     current_time = now.strftime("%H:%M")
     current_date = now.strftime("%Y-%m-%d")
     
@@ -791,7 +798,7 @@ async def check_and_send_grind_alerts():
             logging.error(f"Failed to send Grind Alert to chat {chat_id}: {e}")
 
 async def check_and_send_route_alerts():
-    now = datetime.datetime.now()
+    now = now_ist()
     current_time = now.strftime("%H:%M")
     current_date = now.strftime("%Y-%m-%d")
     
@@ -837,7 +844,7 @@ async def check_and_send_route_alerts():
             logging.error(f"Failed to send route alert to chat {chat_id}: {e}")
 
 async def check_and_send_job_alerts():
-    now = datetime.datetime.now()
+    now = now_ist()
     current_time = now.strftime("%H:%M")
     current_date = now.strftime("%Y-%m-%d")
 
@@ -874,7 +881,7 @@ async def scheduler_loop():
         except Exception as e:
             logging.error(f"Error in scheduler check: {e}")
             
-        now = datetime.datetime.now()
+        now = now_ist()
         sleep_seconds = 60 - now.second
         if sleep_seconds <= 0:
             sleep_seconds = 60
@@ -915,7 +922,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 elif target == "grind":
                     setup["state"] = "AWAITING_GRIND_TIME"
-                    current_time = datetime.datetime.now().strftime("%H:%M")
+                    current_time = now_ist().strftime("%H:%M")
                     await update.message.reply_text(
                         "Password accepted! Let's set up your daily Grind Alert! 🧠\n\n"
                         "At what time daily would you like to receive 1 System Design problem and 2 LeetCode DSA problems?\n"
@@ -982,7 +989,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 setup["destination_lat"] = results[0]["lat"]
                 setup["destination_lon"] = results[0]["lon"]
                 setup["state"] = "AWAITING_TIME"
-                current_time = datetime.datetime.now().strftime("%H:%M")
+                current_time = now_ist().strftime("%H:%M")
                 await processing_msg.edit_text(
                     f"Destination set to: {results[0]['display_name']}\n\n"
                     f"Finally, please enter the daily scheduled time in 24-hour HH:MM format (e.g., 08:30 or 17:45).\n"
@@ -1138,7 +1145,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             setup["freshness_seconds"] = freshness_map[choice]
             setup["freshness_label"] = freshness_labels[choice]
             setup["state"] = "AWAITING_JOB_TIME"
-            current_time = datetime.datetime.now().strftime("%H:%M")
+            current_time = now_ist().strftime("%H:%M")
             await update.message.reply_text(
                 f"Freshness: {freshness_labels[choice]} ✓\n\n"
                 "At what time daily would you like to receive your job listings?\n"
