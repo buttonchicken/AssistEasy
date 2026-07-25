@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import asyncio
 import datetime
@@ -383,7 +384,8 @@ async def delete_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"Could not find route with ID {route_id} scheduled by you.")
 
-SYSTEM_DESIGN_DOMAINS = [
+# Fallback pools, only used if the live fetches below fail (network error, site/API changes, etc.)
+SYSTEM_DESIGN_DOMAINS_FALLBACK = [
     "Bitly (URL shortener)", "Uber (Ride sharing / Geolocation)", "Netflix or YouTube (Video streaming / CDN)",
     "Dropbox or Google Drive (File sync & storage)", "Twitter or Facebook (News feed architecture)",
     "WhatsApp or Slack (Real-time chat & presence)", "Airbnb or Booking.com (Hotel reservation)",
@@ -395,24 +397,131 @@ SYSTEM_DESIGN_DOMAINS = [
     "API Gateway", "Distributed Job Scheduler"
 ]
 
-DSA_TOPICS = [
-    "Sliding Window", "Two Pointers", "Fast & Slow Pointers", "Merge Intervals",
-    "In-place Reversal of a Linked List", "Breadth-First Search (BFS)",
-    "Depth-First Search (DFS)", "Two Heaps", "Subsets (Backtracking)", "Modified Binary Search",
-    "Top K Elements (Heaps)", "K-way Merge", "Topological Sort (Graphs)", "Dynamic Programming (Knapsack/DP)",
-    "Trie (Prefix Tree)", "Union Find / Disjoint Set", "Segment Tree or Fenwick Tree", "Monotonic Stack / Queue"
-]
+LEETCODE_GRAPHQL_URL = "https://leetcode.com/graphql"
+SYSTEM_DESIGN_PRIMER_README_URL = "https://raw.githubusercontent.com/donnemartin/system-design-primer/master/README.md"
+_SYSTEM_DESIGN_TOPICS_CACHE = {"topics": [], "fetched_at": None}
+_SYSTEM_DESIGN_CACHE_TTL = datetime.timedelta(hours=24)
+
+def _readme_section(text: str, header: str) -> str:
+    match = re.search(r"^## " + re.escape(header) + r"\n(.*?)\n## ", text, re.S | re.M)
+    return match.group(1) if match else ""
+
+def _scrape_system_design_topics() -> list:
+    """Scrape real interview-style design prompts and core system design concepts from the system-design-primer README."""
+    resp = requests.get(SYSTEM_DESIGN_PRIMER_README_URL, timeout=10)
+    resp.raise_for_status()
+    text = resp.text
+
+    interview_prompts = re.findall(
+        r"^### (.+)$", _readme_section(text, "System design interview questions with solutions"), re.M
+    )
+
+    core_start = text.find("## Performance vs scalability")
+    core_end = text.find("## Appendix")
+    core_topics = []
+    if core_start != -1 and core_end != -1:
+        core_topics = re.findall(r"^## (.+)$", text[core_start:core_end], re.M)
+
+    return interview_prompts + core_topics
+
+async def get_system_design_topic() -> str:
+    """Return a random system design case study title, live-scraped and cached for a day."""
+    import random
+    now = datetime.datetime.now()
+    cache = _SYSTEM_DESIGN_TOPICS_CACHE
+    if not (cache["topics"] and cache["fetched_at"] and now - cache["fetched_at"] < _SYSTEM_DESIGN_CACHE_TTL):
+        try:
+            loop = asyncio.get_event_loop()
+            topics = await loop.run_in_executor(None, _scrape_system_design_topics)
+            if topics:
+                cache["topics"] = topics
+                cache["fetched_at"] = now
+        except Exception as e:
+            logging.error(f"Failed to scrape system design topics, falling back to static list: {e}")
+    return random.choice(cache["topics"] or SYSTEM_DESIGN_DOMAINS_FALLBACK)
+
+def _fetch_random_leetcode_problems(count: int = 2) -> list:
+    """Fetch `count` distinct random real (non-paywalled) problems via LeetCode's public GraphQL API."""
+    import random
+    query = """
+    query problemsetQuestionList($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionListFilterInput) {
+      problemsetQuestionList: questionList(categorySlug: $categorySlug, limit: $limit, skip: $skip, filters: $filters) {
+        total: totalNum
+        questions: data {
+          title
+          titleSlug
+          difficulty
+          isPaidOnly
+          topicTags { name }
+        }
+      }
+    }
+    """
+    headers = {"Content-Type": "application/json", "Referer": "https://leetcode.com"}
+
+    def run_query(skip, limit):
+        resp = requests.post(
+            LEETCODE_GRAPHQL_URL,
+            json={"query": query, "variables": {"categorySlug": "", "skip": skip, "limit": limit, "filters": {}}},
+            headers=headers, timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["data"]["problemsetQuestionList"]
+
+    total = run_query(0, 1)["total"]
+
+    problems = []
+    seen_slugs = set()
+    for _ in range(count * 5):
+        if len(problems) >= count:
+            break
+        skip = random.randint(0, total - 1)
+        data = run_query(skip, 1)["questions"]
+        if not data:
+            continue
+        q = data[0]
+        if q["isPaidOnly"] or q["titleSlug"] in seen_slugs:
+            continue
+        seen_slugs.add(q["titleSlug"])
+        problems.append({
+            "title": q["title"],
+            "difficulty": q["difficulty"],
+            "tags": [t["name"] for t in q["topicTags"]],
+            "link": f"https://leetcode.com/problems/{q['titleSlug']}/",
+        })
+    return problems
 
 async def fetch_grind_problems():
-    import random
-    sys_topic = random.choice(SYSTEM_DESIGN_DOMAINS)
-    dsa_topic_1 = random.choice(DSA_TOPICS)
-    dsa_topic_2 = random.choice([t for t in DSA_TOPICS if t != dsa_topic_1])
+    sys_topic = await get_system_design_topic()
+
+    dsa_problems = []
+    try:
+        loop = asyncio.get_event_loop()
+        dsa_problems = await loop.run_in_executor(None, _fetch_random_leetcode_problems, 2)
+    except Exception as e:
+        logging.error(f"Failed to fetch random LeetCode problems: {e}")
+
+    if len(dsa_problems) == 2:
+        dsa_instructions = (
+            "2. Two DSA (Data Structures and Algorithms) problems. These are real LeetCode problems -- "
+            "use their exact name, difficulty, and link as given below, and write a brief 1-sentence description "
+            "of what each problem asks. Do NOT invent a different problem, difficulty, or link.\n"
+            + "\n".join(
+                f"   - \"{p['title']}\" (Difficulty: {p['difficulty']}, Topics: {', '.join(p['tags'][:3]) or 'General'}) - {p['link']}"
+                for p in dsa_problems
+            )
+        )
+    else:
+        dsa_instructions = (
+            "2. Two random DSA (Data Structures and Algorithms) problems covering different concepts. "
+            "For each, provide the name, difficulty (Easy/Medium/Hard), a brief 1-sentence description, "
+            "and their official LeetCode link. Ensure the links are valid."
+        )
 
     prompt = (
         f"Generate a technical study set containing:\n"
         f"1. One System Design problem/topic related to: {sys_topic}. Provide a brief overview of key challenges, database choices, and scaling.\n"
-        f"2. Two random DSA (Data Structures and Algorithms) problems. One problem must focus on the concept of '{dsa_topic_1}', and the other must focus on the concept of '{dsa_topic_2}'. For each, provide the name, difficulty (Easy/Medium/Hard), a brief 1-sentence description, and their official LeetCode link. Ensure the links are valid.\n\n"
+        f"{dsa_instructions}\n\n"
         f"Formatting constraints: Do NOT use asterisks (*) for bold or italics. For lists, use simple dashes (-) or numbers. Keep it clean and readable."
     )
     for attempt in range(3):
