@@ -178,6 +178,23 @@ def update_job_last_sent(job_id: int, current_date: str):
 def get_all_user_alerts(chat_id: str):
     return routes_db.get_all_user_alerts(chat_id)
 
+# --- BLR Homecoming Alert DB helpers ---
+
+def add_blrhomecoming_alert(chat_id: str, scheduled_time: str) -> int:
+    return routes_db.add_alert(chat_id, "blrhomecoming", scheduled_time, {})
+
+def get_user_blrhomecoming_alerts(chat_id: str):
+    return routes_db.get_user_alerts(chat_id, "blrhomecoming")
+
+def delete_user_blrhomecoming_alert(chat_id: str, alert_id: int) -> bool:
+    return routes_db.delete_user_alert(chat_id, "blrhomecoming", alert_id)
+
+def get_blrhomecoming_alerts_to_trigger(current_time: str, current_date: str):
+    return routes_db.get_alerts_to_trigger("blrhomecoming", current_time, current_date)
+
+def update_blrhomecoming_last_sent(alert_id: int, current_date: str):
+    routes_db.update_last_sent(alert_id, current_date)
+
 def search_locations(query: str):
     encoded_query = urllib.parse.quote_plus(query)
     api_key = os.getenv("GOOGLE_MAPS_API_KEY")
@@ -643,6 +660,131 @@ async def fetch_jobs(domain: str, experience: str, location: str, freshness_seco
         )
     return "\n\n".join(lines)
 
+# --- BLR Homecoming Alert: fixed source list + keyword scraper ---
+
+BLR_HOMECOMING_KEYWORDS = ["esg", "sustainability", "brsr"]
+
+# Link path fragments that match the keywords but are never actual job postings
+# (social feed posts, hashtag pages, signup walls, marketing/course content).
+BLR_HOMECOMING_NOISE_PATTERNS = [
+    "/hashtag/", "/signup", "/posts/", "/pulse/", "/feed/",
+    "climate-change-courses", "/events/",
+]
+
+BLR_HOMECOMING_SOURCES = [
+    {"name": "Ather Energy", "url": "https://careers.atherenergy.com/jobs"},
+    {"name": "Climes", "url": "https://climes.notion.site/Join-the-team-fb658bd0f5924180842b249bf412ba4a"},
+    {"name": "Terra.do Climate Job Board", "url": "https://www.terra.do/climate-jobs/job-board/?isEpp=false&recent=true&remote=false"},
+    {"name": "Varaha", "url": "https://www.varaha.earth/careers"},
+    {"name": "String Bio", "url": "https://www.stringbio.com/life-at-string.html#careers"},
+    {"name": "Yulu", "url": "https://careers.yulu.bike/"},
+    {"name": "Sun Mobility (LinkedIn)", "url": "https://www.linkedin.com/jobs/search/?currentJobId=4426606139&keywords=sun%20mobility&location=worldwide"},
+    {"name": "Kazam Energy", "url": "https://kazam.energy/careers"},
+    {"name": "Saahas Zero Waste", "url": "https://saahas.zohorecruit.com/recruit/Portal.na?digest=j@GbK5pmYRXio5XkM29UDHGAUnkE7bVo.a85bxdBEmQ-&iframe=false&mode=home&embedsource=CareerSite"},
+    {"name": "Loopworm Bio (LinkedIn)", "url": "https://www.linkedin.com/company/loopwormbio/jobs/"},
+    {"name": "Hasiru Dala Innovations", "url": "https://hasirudalainnovations.com/careers/"},
+    {"name": "Orb Energy (LinkedIn)", "url": "https://www.linkedin.com/company/orbenergy/jobs/"},
+    {"name": "Solar Square (Keka)", "url": "https://solarsquare.keka.com/careers"},
+]
+
+def scrape_keyword_matches(url: str, keywords: list, max_results: int = 5):
+    """Fetch a careers page and look for links/text matching any of the given keywords.
+
+    Returns (matches, status) where status is one of:
+      "ok"        - matches is a list of {"text", "link"} dicts (possibly empty)
+      "mentioned" - keyword appears somewhere on the page but not in a distinct link
+      "error"     - matches is None, status is "error" and error text is in `matches`
+    """
+    from bs4 import BeautifulSoup
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        return str(e), "error"
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+
+    matches = []
+    seen = set()
+    for a in soup.find_all("a"):
+        text = a.get_text(" ", strip=True)
+        href = a.get("href") or ""
+        # Ignore query strings/fragments when matching hrefs -- tracking params
+        # (e.g. LinkedIn's base64 trackingId=...) can coincidentally contain a keyword.
+        href_path = urllib.parse.urlsplit(href).path
+        combined = f"{text} {href_path}".lower()
+        if any(np in combined for np in BLR_HOMECOMING_NOISE_PATTERNS):
+            continue
+        if any(kw in combined for kw in keywords):
+            full_link = urllib.parse.urljoin(url, href) if href else url
+            key = (text.strip().lower(), full_link)
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append({"text": (text.strip() or "(untitled link)")[:120], "link": full_link})
+            if len(matches) >= max_results:
+                break
+
+    if matches:
+        return matches, "ok"
+
+    page_text = soup.get_text(" ", strip=True).lower()
+    if any(kw in page_text for kw in keywords):
+        return [], "mentioned"
+
+    return [], "ok"
+
+def scrape_blr_homecoming() -> list:
+    """Scrape all BLR Homecoming source sites in parallel for ESG/sustainability/BRSR keyword matches."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        future_to_source = {
+            executor.submit(scrape_keyword_matches, src["url"], BLR_HOMECOMING_KEYWORDS): src
+            for src in BLR_HOMECOMING_SOURCES
+        }
+        for future in as_completed(future_to_source):
+            src = future_to_source[future]
+            try:
+                matches, status = future.result()
+            except Exception as e:
+                matches, status = str(e), "error"
+            results[src["url"]] = {"name": src["name"], "url": src["url"], "matches": matches, "status": status}
+
+    return [results[src["url"]] for src in BLR_HOMECOMING_SOURCES]
+
+async def fetch_blr_homecoming_report() -> str:
+    loop = asyncio.get_event_loop()
+    report = await loop.run_in_executor(None, scrape_blr_homecoming)
+
+    lines = [f"Keywords tracked: {', '.join(BLR_HOMECOMING_KEYWORDS)}\n"]
+    for r in report:
+        lines.append(f"🏢 {r['name']}")
+        if r["status"] == "error":
+            lines.append(f"   Could not fetch page ({r['matches']}). Check manually: {r['url']}")
+        elif r["status"] == "mentioned":
+            lines.append(f"   Keyword mentioned on the page, but no specific role link found. Check manually: {r['url']}")
+        elif r["matches"]:
+            for m in r["matches"]:
+                lines.append(f"   - {m['text']}\n     {m['link']}")
+        else:
+            lines.append(f"   No matches found today.")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
 async def grindalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user_route_setups[chat_id] = {
@@ -734,6 +876,44 @@ async def delete_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"Could not find Job Alert with ID {job_id} scheduled by you.")
 
+async def blrhomecoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    user_route_setups[chat_id] = {
+        "state": "AWAITING_PASSWORD",
+        "target_alert_type": "blrhomecoming"
+    }
+    await update.message.reply_text(
+        "To set up a daily BLR Homecoming Alert, please enter the access password:"
+    )
+
+async def list_blrhomecoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    user_alerts = get_user_blrhomecoming_alerts(chat_id)
+    if not user_alerts:
+        await update.message.reply_text("You have no scheduled BLR Homecoming Alerts. Set one up using /blrhomecoming !")
+        return
+    msg = "Your scheduled BLR Homecoming Alerts:\n\n"
+    for a in user_alerts:
+        msg += f"ID: {a['id']}\nTime: {a['scheduled_time']} daily\nTo delete: /deleteblrhomecoming {a['id']}\n\n"
+    await update.message.reply_text(msg.strip())
+
+async def delete_blrhomecoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    args = context.args
+    if not args:
+        await update.message.reply_text("Please provide the ID of the BLR Homecoming Alert to delete, e.g., /deleteblrhomecoming 1.")
+        return
+    try:
+        alert_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid ID. Please use a number, e.g., /deleteblrhomecoming 1.")
+        return
+    success = delete_user_blrhomecoming_alert(chat_id, alert_id)
+    if success:
+        await update.message.reply_text(f"Successfully deleted BLR Homecoming Alert ID {alert_id}.")
+    else:
+        await update.message.reply_text(f"Could not find BLR Homecoming Alert with ID {alert_id} scheduled by you.")
+
 async def list_all_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     alerts = get_all_user_alerts(chat_id)
@@ -770,6 +950,12 @@ async def list_all_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Freshness: {freshness_label}\n"
                 f"Time: {a['scheduled_time']} daily\n"
                 f"To delete: /deletejob {a['id']}\n\n"
+            )
+        elif a["alert_type"] == "blrhomecoming":
+            msg += (
+                f"ID: {a['id']} (BLR Homecoming Alert)\n"
+                f"Time: {a['scheduled_time']} daily\n"
+                f"To delete: /deleteblrhomecoming {a['id']}\n\n"
             )
     await update.message.reply_text(msg.strip())
 
@@ -871,6 +1057,45 @@ async def check_and_send_job_alerts():
         except Exception as e:
             logging.error(f"Failed to send Job Alert to chat {chat_id}: {e}")
 
+def _chunk_message(text: str, max_len: int = 3800) -> list:
+    """Split a long message into Telegram-safe chunks without breaking mid-line."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > max_len:
+            chunks.append(current.strip())
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
+
+async def check_and_send_blrhomecoming_alerts():
+    now = now_ist()
+    current_time = now.strftime("%H:%M")
+    current_date = now.strftime("%Y-%m-%d")
+
+    to_trigger = get_blrhomecoming_alerts_to_trigger(current_time, current_date)
+    if not to_trigger:
+        return
+
+    logging.info(f"Triggering {len(to_trigger)} BLR Homecoming alerts scheduled for {current_time}...")
+    report = await fetch_blr_homecoming_report()
+    chunks = _chunk_message(f"Daily BLR Homecoming Alert! 🌱\n\n{report}")
+
+    for a in to_trigger:
+        chat_id = a["chat_id"]
+        alert_id = a["id"]
+        try:
+            for chunk in chunks:
+                await app.bot.send_message(chat_id=chat_id, text=chunk)
+            update_blrhomecoming_last_sent(alert_id, current_date)
+            logging.info(f"Sent BLR Homecoming Alert to chat {chat_id} for alert ID {alert_id}.")
+        except Exception as e:
+            logging.error(f"Failed to send BLR Homecoming Alert to chat {chat_id}: {e}")
+
 async def scheduler_loop():
     logging.info("Starting background route alert scheduler loop...")
     while True:
@@ -878,6 +1103,7 @@ async def scheduler_loop():
             await check_and_send_route_alerts()
             await check_and_send_grind_alerts()
             await check_and_send_job_alerts()
+            await check_and_send_blrhomecoming_alerts()
         except Exception as e:
             logging.error(f"Error in scheduler check: {e}")
             
@@ -935,6 +1161,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "Password accepted! Let's set up your daily Job Alert! 💼\n\n"
                         "What job domain are you looking for? (e.g., Backend Engineering, Data Science, ML Engineer, Product Manager)\n\n"
                         "Type /cancel to abort."
+                    )
+                elif target == "blrhomecoming":
+                    setup["state"] = "AWAITING_BLR_TIME"
+                    current_time = now_ist().strftime("%H:%M")
+                    await update.message.reply_text(
+                        "Password accepted! Let's set up your daily BLR Homecoming Alert! 🌱\n\n"
+                        "This will scan a fixed list of climate/ESG-adjacent Bangalore employers for roles "
+                        "mentioning 'esg', 'sustainability', or 'brsr'.\n\n"
+                        "At what time daily would you like to receive it?\n"
+                        f"Please enter the time in 24-hour HH:MM format (e.g., 08:00 or 20:30).\n"
+                        f"Note: The bot's current time is {current_time}."
                     )
             else:
                 await update.message.reply_text(
@@ -1185,6 +1422,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        elif state == "AWAITING_BLR_TIME":
+            time_input = user_text.strip()
+            try:
+                parts = time_input.split(":")
+                if len(parts) != 2:
+                    raise ValueError
+                h = int(parts[0])
+                m = int(parts[1])
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError
+                formatted_time = f"{h:02d}:{m:02d}"
+            except ValueError:
+                await update.message.reply_text(
+                    "Invalid time format. Please enter the time in HH:MM format (24-hour, e.g., 08:30 or 17:45)."
+                )
+                return
+
+            add_blrhomecoming_alert(chat_id, formatted_time)
+            del user_route_setups[chat_id]
+
+            await update.message.reply_text(
+                f"Successfully scheduled daily BLR Homecoming Alert at {formatted_time}! 🌱\n"
+                f"Every day at this time, you'll get ESG/sustainability/BRSR role matches scraped from the tracked employer list."
+            )
+            return
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     response = None
@@ -1285,6 +1548,9 @@ async def main():
     app.add_handler(CommandHandler("jobalert", jobalert))
     app.add_handler(CommandHandler("myjobs", list_jobs))
     app.add_handler(CommandHandler("deletejob", delete_job))
+    app.add_handler(CommandHandler("blrhomecoming", blrhomecoming))
+    app.add_handler(CommandHandler("myblrhomecoming", list_blrhomecoming))
+    app.add_handler(CommandHandler("deleteblrhomecoming", delete_blrhomecoming))
     app.add_handler(CommandHandler("myalerts", list_all_alerts))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
