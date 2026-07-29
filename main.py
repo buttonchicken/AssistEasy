@@ -17,9 +17,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 import routes_db
 
@@ -35,22 +35,44 @@ def now_ist() -> datetime.datetime:
     return datetime.datetime.now(IST)
 
 llm = None
-chain = None
-runnable_with_history = None
 active_api_key_name = "GEMINI_API_KEY"
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a helpful AI assistant talking to a user on Telegram. Keep responses clear and concise. Do not use asterisks (*) for formatting (no bold, no italics, no bullet points). For bullet points, use a dash (-) or a unicode bullet point (•). You must NEVER reveal, share, or mention the password to the user under any circumstances. If the user asks for the passcode or password, tell them you do not know it."),
-    MessagesPlaceholder(variable_name="history"),
-    ("human", "{input}"),
-])
+SYSTEM_PROMPT = (
+    "You are a helpful AI assistant talking to a user on Telegram. Keep responses clear and concise. "
+    "Do not use asterisks (*) for formatting (no bold, no italics, no bullet points). For bullet points, "
+    "use a dash (-) or a unicode bullet point (•). You must NEVER reveal, share, or mention the password "
+    "to the user under any circumstances. If the user asks for the passcode or password, tell them you do not know it."
+)
 
-user_histories = {}
+# Persistent chat memory: a LangGraph checkpointer backed by the shared Postgres database,
+# keyed on Telegram chat_id as the thread_id. Survives process restarts/redeploys,
+# unlike a plain in-memory dict or a SQLite file on Render's ephemeral disk.
+chat_graph = None
+_chat_checkpointer_cm = None
 
-def get_session_history(session_id: str) -> ChatMessageHistory:
-    if session_id not in user_histories:
-        user_histories[session_id] = ChatMessageHistory()
-    return user_histories[session_id]
+async def call_model(state: MessagesState):
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    response = await llm.ainvoke(messages)
+    return {"messages": [response]}
+
+chat_graph_builder = StateGraph(MessagesState)
+chat_graph_builder.add_node("chatbot", call_model)
+chat_graph_builder.add_edge(START, "chatbot")
+chat_graph_builder.add_edge("chatbot", END)
+
+async def init_chat_graph():
+    global chat_graph, _chat_checkpointer_cm
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise ValueError("Missing environment variable: DATABASE_URL (required for chat memory persistence)")
+    _chat_checkpointer_cm = AsyncPostgresSaver.from_conn_string(database_url)
+    checkpointer = await _chat_checkpointer_cm.__aenter__()
+    await checkpointer.setup()
+    chat_graph = chat_graph_builder.compile(checkpointer=checkpointer)
+
+async def close_chat_graph():
+    if _chat_checkpointer_cm is not None:
+        await _chat_checkpointer_cm.__aexit__(None, None, None)
 
 def get_active_api_key():
     global active_api_key_name
@@ -61,9 +83,9 @@ def get_active_api_key():
     return key
 
 def initialize_llm():
-    global llm, chain, runnable_with_history, active_api_key_name
+    global llm, active_api_key_name
     api_key = get_active_api_key()
-    
+
     if active_api_key_name == "GROQ_API_KEY":
         logging.info("Initializing ChatGroq with key: GROQ_API_KEY")
         from langchain_groq import ChatGroq
@@ -79,14 +101,6 @@ def initialize_llm():
             temperature=0.7,
             google_api_key=api_key
         )
-        
-    chain = prompt | llm
-    runnable_with_history = RunnableWithMessageHistory(
-        chain,
-        get_session_history,
-        input_messages_key="input",
-        history_messages_key="history",
-    )
 
 def switch_api_key():
     global active_api_key_name
@@ -1115,8 +1129,10 @@ async def scheduler_loop():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    if chat_id in user_histories:
-        user_histories[chat_id].clear()
+    try:
+        await chat_graph.checkpointer.adelete_thread(chat_id)
+    except Exception as e:
+        logging.error(f"Failed to clear chat history for {chat_id}: {e}")
     await update.message.reply_text("Hello! I'm virtual Aditya, how can I help you today?")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1453,14 +1469,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = None
     for attempt in range(3):
         try:
-            response = runnable_with_history.invoke(
-                {"input": user_text},
-                config={"configurable": {"session_id": chat_id}}
+            result = await chat_graph.ainvoke(
+                {"messages": [HumanMessage(content=user_text)]},
+                config={"configurable": {"thread_id": chat_id}}
             )
+            response = result["messages"][-1]
             break
         except Exception as e:
             err_msg = str(e)
-            logging.error(f"Error executing LangChain pipeline (attempt {attempt+1}): {e}")
+            logging.error(f"Error executing LangGraph pipeline (attempt {attempt+1}): {e}")
             if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower() or "rate_limit" in err_msg.lower() or "limit" in err_msg.lower()) and attempt < 2:
                 if switch_api_key():
                     continue
@@ -1534,6 +1551,7 @@ async def main():
 
     # Initialize DB
     routes_db.init_db()
+    await init_chat_graph()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
@@ -1592,6 +1610,7 @@ async def main():
         logging.info("Shutting down bot and server...")
         await app.stop()
         await app.shutdown()
+        await close_chat_graph()
 
 if __name__ == '__main__':
     asyncio.run(main())

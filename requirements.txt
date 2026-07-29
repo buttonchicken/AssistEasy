@@ -51,3 +51,6 @@ langchain-groq
 beautifulsoup4
 lxml
 tzdata
+langgraph-checkpoint-postgres==3.1.0
+psycopg[binary]==3.3.4
+psycopg-pool==3.3.1
