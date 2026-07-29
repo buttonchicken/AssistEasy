@@ -67,3 +67,6 @@ Anything that isn't a recognized command is treated as a normal chat message.
 ## Data
 
 A single `alerts` table in Postgres stores all alert types (route, grind, job, ...), keyed by Telegram chat ID with a JSON payload column for type-specific fields. Chat conversation history is stored separately as LangGraph checkpoints in the same database.
+
+<img width="1080" height="2073" alt="HOA8Rx7bUAAZhUL" src="https://github.com/user-attachments/assets/ec27dcd2-649e-44ef-9a54-276b3c8dbba1" />
+
